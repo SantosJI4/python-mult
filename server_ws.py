@@ -2,44 +2,48 @@ import asyncio
 import json
 import time
 import random
-import websockets
+import os
+from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+app = FastAPI()
+
+# CORS para aceitar requisições de qualquer origem
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 HOST = '0.0.0.0'
-PORT = 80
-BROADCAST_FPS = 20  # 20 updates per second
+PORT = int(os.environ.get('PORT', 8000))  # SquaredCloud fornece PORT via variável
 
 next_id = 1
 clients = {}   # id -> websocket
 players = {}   # id -> {name, x, y, color, hp, max_hp, invuln_until}
-lock = asyncio.Lock()
 
 
-async def send_line(ws, obj):
-    try:
-        await ws.send(json.dumps(obj) + "\n")
-    except Exception:
-        pass
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Game server online"}
 
 
-async def broadcast(obj):
-    if not clients:
-        return
-    to_send = json.dumps(obj) + "\n"
-    coros = []
-    for ws in list(clients.values()):
-        coros.append(ws.send(to_send))
-    # ignore individual send errors
-    try:
-        await asyncio.gather(*coros, return_exceptions=True)
-    except Exception:
-        pass
+@app.get("/health")
+async def health():
+    return {"players": len(players), "clients": len(clients)}
 
 
-async def handle_client(ws):
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
     global next_id
+    await websocket.accept()
     cid = None
     try:
-        async for line in ws:
+        while True:
+            line = await websocket.receive_text()
             if not line.strip():
                 continue
             try:
@@ -48,28 +52,26 @@ async def handle_client(ws):
                 continue
             t = msg.get('type')
             if t == 'hello':
-                async with lock:
-                    cid = next_id
-                    next_id += 1
-                    clients[cid] = ws
-                    color = [random.randint(50, 255) for _ in range(3)]
-                    players[cid] = {
-                        'name': msg.get('name', f'Player{cid}'),
-                        'x': float(msg.get('x', 100)),
-                        'y': float(msg.get('y', 100)),
-                        'color': msg.get('color', color),
-                        'hp': 100,
-                        'max_hp': 100,
-                        'invuln_until': 0.0,
-                    }
-                await send_line(ws, {'type': 'welcome', 'id': cid})
+                cid = next_id
+                next_id += 1
+                clients[cid] = websocket
+                color = [random.randint(50, 255) for _ in range(3)]
+                players[cid] = {
+                    'name': msg.get('name', f'Player{cid}'),
+                    'x': float(msg.get('x', 100)),
+                    'y': float(msg.get('y', 100)),
+                    'color': msg.get('color', color),
+                    'hp': 100,
+                    'max_hp': 100,
+                    'invuln_until': 0.0,
+                }
+                await websocket.send_json({'type': 'welcome', 'id': cid})
 
             elif t == 'pos' and cid is not None:
-                async with lock:
-                    p = players.get(cid)
-                    if p:
-                        p['x'] = float(msg.get('x', p['x']))
-                        p['y'] = float(msg.get('y', p['y']))
+                p = players.get(cid)
+                if p:
+                    p['x'] = float(msg.get('x', p['x']))
+                    p['y'] = float(msg.get('y', p['y']))
 
             elif t == 'shot' and cid is not None:
                 shot = {
@@ -89,58 +91,56 @@ async def handle_client(ws):
                 victim = int(msg.get('victim')) if 'victim' in msg else None
                 dmg = int(msg.get('damage', 0))
                 if victim is not None:
-                    async with lock:
-                        vp = players.get(victim)
-                        if vp:
-                            # Ignore damage if invulnerable
-                            if time.time() >= vp.get('invuln_until', 0):
-                                vp['hp'] = max(0, vp.get('hp', 100) - dmg)
-                            hp_msg = {'type': 'hp', 'id': victim, 'hp': vp['hp']}
+                    vp = players.get(victim)
+                    if vp:
+                        if time.time() >= vp.get('invuln_until', 0):
+                            vp['hp'] = max(0, vp.get('hp', 100) - dmg)
+                        hp_msg = {'type': 'hp', 'id': victim, 'hp': vp['hp']}
                     await broadcast(hp_msg)
 
             elif t == 'revive' and cid is not None:
-                async with lock:
-                    p = players.get(cid)
-                    if p:
-                        p['hp'] = p.get('max_hp', 100)
-                        p['invuln_until'] = time.time() + 1.5
-                        hp_msg = {'type': 'hp', 'id': cid, 'hp': p['hp']}
+                p = players.get(cid)
+                if p:
+                    p['hp'] = p.get('max_hp', 100)
+                    p['invuln_until'] = time.time() + 1.5
+                    hp_msg = {'type': 'hp', 'id': cid, 'hp': p['hp']}
                 await broadcast(hp_msg)
 
     except Exception:
         pass
     finally:
-        async with lock:
-            if cid in clients:
-                try:
-                    del clients[cid]
-                except Exception:
-                    pass
-            if cid in players:
-                try:
-                    del players[cid]
-                except Exception:
-                    pass
+        if cid in clients:
+            del clients[cid]
+        if cid in players:
+            del players[cid]
+
+
+async def broadcast(obj):
+    if not clients:
+        return
+    bad_clients = []
+    for cid, ws in list(clients.items()):
         try:
-            await ws.close()
+            await ws.send_json(obj)
         except Exception:
-            pass
+            bad_clients.append(cid)
+    for cid in bad_clients:
+        if cid in clients:
+            del clients[cid]
 
 
 async def broadcast_loop():
-    interval = 1.0 / BROADCAST_FPS
     while True:
-        await asyncio.sleep(interval)
-        async with lock:
-            state = {'type': 'state', 'players': players}
+        await asyncio.sleep(0.05)
+        state = {'type': 'state', 'players': players}
         await broadcast(state)
 
 
-async def start_server(host=HOST, port=PORT):
-    async with websockets.serve(handle_client, host, port, max_size=2**20):
-        print(f"WebSocket server listening on ws://{host}:{port}")
-        await broadcast_loop()
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(broadcast_loop())
 
 
 if __name__ == '__main__':
-    asyncio.run(start_server())
+    print(f"Starting server on {HOST}:{PORT}")
+    uvicorn.run(app, host=HOST, port=PORT)
