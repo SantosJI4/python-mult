@@ -5,7 +5,7 @@ import random
 import websockets
 
 HOST = '0.0.0.0'
-PORT = 8765
+PORT = 80
 BROADCAST_FPS = 20  # 20 updates per second
 
 next_id = 1

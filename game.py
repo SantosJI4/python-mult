@@ -165,8 +165,8 @@ class GameClient:
     self.connected = False
     self.client_id = None
     # Networking mode: 'tcp' or 'ws'
-    self.net_mode = 'tcp'  # set to 'ws' to use WebSocket
-    self.ws_url = 'ws://localhost:8765'
+    self.net_mode = 'ws'  # set to 'ws' to use WebSocket
+    self.ws_url = 'wss://pythonmult.squareweb.app'
     self.ws_runner = None
     
     # Controle por clique (click-to-move)
@@ -220,7 +220,7 @@ class GameClient:
     # Respawn invulnerability window
     self.invuln_until = 0.0
   
-  def connect_to_server(self, host='localhost', port=12345):
+  def connect_to_server(self, host='pythonmult.squareweb.app', port=12345):
     try:
       self.socket.connect((host, port))
       self.connected = True
